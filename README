@@ -1,0 +1,267 @@
+NOTE: it is not recommended that you use this IPC mechanism for mission-critical
+programs. I have used it in small scale automation and process control applications,
+but it was written as an experiment and has not been through the extensive deployment
+or testing that "real" IPC mechanisms have.
+
+This repository contains code to produce the following programs.
+With the exception of tagfd.ko, the other targets are all built using 
+[repo root]/Makefile. Running "make all" from the repository directory should build
+them all. 
+
+
+tagfd : A linux kernel module (tagfd.ko)
+----------------------------------------------------
+Tagfd is a Linux kernel extension that adds a new interprocess communication 
+(IPC) mechanism. Unix inspired operating systems take the "everything is a file"
+approach, and represent nearly everything on the system (including devices,
+sockets, and whatnot) as files. This means that a single API can be used to 
+interact with virtually anything on the system. That API is the standard set of
+Unix functions that work on file descriptors - open(), close(), read(), write(),
+poll(), and so on. With tagfd, programs can use that same set of functions
+to exchange data structures called "items" / "tags". An tag has the 
+following components (this structure was inspired by OPC):
+
+    NAME        The name of the tag - can contain only alphanumeric characters
+                plus those from "._-". Maximum name length is 255 characters.
+    
+    DATA TYPE   Indicates the type of data stored in the value field. 
+    
+    VALUE       The tag's value. This can be a signed or unsigned integer of 
+                8/16/32/64 bits, a 32 or 64 bit floating point number, a text 
+                string (or, really, binary string) of up to 16 bytes, or a
+                timestamp stored in a 64 bit integer (Unix millisecond timestamp).
+    
+    QUALITY     The quality of the tag's value. This is a 16 bit unsigned 
+                integer field, with the upper two bits indicating one of:
+                "Good" (the value should be reliable), "Uncertain" (not known
+                what the status is), "Bad" (is known to be unreliable or suspect), 
+                "Disconnected" (it is known that the program responsible for 
+                producing this value is not running). The lower 14 bits are
+                for "vendor use" (i.e. an individual programmer can use them for
+                whatever they want, perhaps specifying error codes, etc).
+    
+    TIMESTAMP   The timestamp (Unix millisecond timestamp) that the current value
+                was produced. 
+
+All configured tags appear as devices (char special files, technically) in the
+/dev/tagfd folder. There will be one entry in that folder per tag. Programs
+are free to open() those devices as if they were files, and read() and write()
+these data structures to them. Once a program reads the value of an tag, further
+calls to read() will block until someone write()s. The files also support poll(),
+allowing for fully event-driven programming. Unlike a pipe or socket, no matter how 
+many writes take place between read calls, only the most recent data will be read.
+
+A device file /dev/tagfd.master is used to set up tags. This can only be
+opened by root. Entities that are written to this device are created in the 
+/dev/tagfd/ folder. 
+
+This target is built separately from the others. To build it, you must be on Linux,
+and have a kernel source tree set up. The Makefile for tagfd.ko is in the 
+src-kernel directory, and it's build process is separate from the others.
+
+
+
+
+tfdconfig : A configuration tool for tagfd
+----------------------------------------------------
+This is a normal userspace application. It's purpose is to facilitate the
+creation of tags (currently deletion is not supported). Only root can run this
+application. Usage is as follows:
+
+Usage: tfdconfig [action] [data type] [name]
+This is the exact order and number of arguments. None are optional.
+
+[action]    Can be '+' (for 'add tag') or 't' (for 'test command').
+            Test command allows you to try a set of arguments without
+            actually creating a tag.
+
+[data type] Can be one of: int8, uint8, int16, uint16, int32, uint32,
+            int64, uint64, real32, real64, timestamp, string. The int
+            types are self-explanatory. Real32 and 64 correspond to C's
+            float and double, respectively. Timestamp is the same as
+            uint64, but represents a timestamp in epoch-milliseconds UTC.
+            String is a text string of at most 16 bytes (or a
+            binary blob of up to that size).
+
+[name]      is the name of the tag to be created. Valid tag names can
+            consist of alphanumeric characters plus any of .-_
+
+A shell script in this repository, create-tags.sh, reads from the config file
+[repo]/cfg/tagfd.conf and creates the tags listed in there by invoking
+tfdconfig. Each line (except blank and comment [#...] lines) specifies a data
+type and a tag name. The shell script runs tfdconfig t on all tags in the file,
+to test their syntax and valididty, and if the tests pass, runs tfdconfig + on
+each of them. 
+
+
+
+
+
+tfd : A command line tool for tagfd
+----------------------------------------------------
+Tfd provides a command line interface for tagfd (it allows users to read
+and write tags from the command line). Running 'tfd help' will display 
+the following information:
+
+Usage: tfd <command> [<args>]
+
+Here are the commands and the arguments they take:
+
+   help  Displays this message.
+
+   list  Lists all tagfd tags found.
+         Can accept a single argument (a string).
+         If supplied, only tags whose names begin with the string will be listed.
+
+   r     READ an tag. Requires 1 argument (the name of the tag to read).
+
+   sv    SET VALUE of a tag. Requires 2 arguments:
+         - Name of the tag to read
+         - New value (must be appropriate for the data type).
+           Remember, if the value contains spaces, it must be
+           surrounded in quotes or the shell may interpret it
+           as multiple arguments. For timestamp values, use
+           the format "YYYY-MM-DD hh:mm:ss.lll" (l for ms).
+
+   sq    SET QUALITY of a tag. Requires 2 arguments:
+         - Name of the tag to read
+         - New quality: GOOD, UNCERTAIN, BAD, or DISCONNECTED.
+         You can also supply an optional third argument:
+         - 'Vendor' quality. This should be a nonnegative
+           integer, maximum 16,383.
+
+--
+
+Example of using tfd:
+
+bash$ tfd list
+   1)  uint32     MyValue.OV
+   2)  uint32     MyValue.PV
+   3)  uint32     MyValue.SP
+   4)  int16      TestValues.i16
+   5)  int32      TestValues.i32
+   6)  int64      TestValues.i64
+   7)  int8       TestValues.i8
+   8)  real32     TestValues.real32
+   9)  real64     TestValues.real64
+  10)  string     TestValues.text
+  11)  timestamp  TestValues.ts
+  12)  uint16     TestValues.u16
+  13)  uint32     TestValues.u32
+  14)  uint64     TestValues.u64
+  15)  uint8      TestValues.u8
+  
+bash$ tfd sv MyValue.SP 999
+
+bash$ tfd r MyValue.SP
+name      MyValue.SP
+dtype     uint32
+quality   UNCERTAIN (0)
+timestamp 2018-04-11 23:00:40.505
+value     999
+
+
+bash$ tfd sq MyValue GOOD 100
+Couldn't open /dev/tagfd/MyValue: No such file or directory
+
+bash$ tfd sq MyValue.SP GOOD 100
+
+bash$ tfd r MyValue.SP
+name      MyValue.SP
+dtype     uint32
+quality   GOOD (100)
+timestamp 2018-04-11 23:01:07.111
+value     999
+
+
+
+
+
+tfdbrowse : An ncurses interface for tagfd
+----------------------------------------------------
+Tfdbrowse is a ncurses interface (like the 'top' program) for tagfd. It allows
+the user to browse the list of tags on the local machine and watch their 
+values in real time, using the terminal. The program is read only - it can be used
+to monitor live changes in the data, but it cannot be used (presently) to MAKE 
+changes to the data. 
+
+
+
+
+
+tfdrelay : A streaming program for tagfd
+----------------------------------------------------
+This program subscribes to tagfd tags and prints text-serialized 
+representations of them to stdout every time the data changes. 
+This stream can be consumed by other programs (including over ssh) to relay
+data around. Command line arguments can be used to specify which tags to 
+subscribe to. Run tfdrelay with no arguments to see the usage instructions. 
+
+The stream format is as follows. The program first outputs a list of tag-index
+associations. These lines have the format:
+
+a [tag index] [tag name] [data type]
+
+The data type is in integer form (see the constants in tagfd-shared.h).
+A blank line indicates the end of the association list.
+
+Then, data starts being streamed. Each line is one data point for one tag, in 
+one of the following two formats. The first format is used normally, the second
+is used if the program was run with the -n flag. 
+
+i [index] [timestamp] [quality] [value]
+n [name] [timestamp] [quality] [value]
+
+timestamp and quality are in integer form, not converted to text. The format of
+the value depends upon the tag's data type. 
+
+
+
+
+
+tfdlog : consumes the output of tfdrelay and logs it to SQLite3
+---------------------------------------------------------------
+This target is currently incomplete and non-functional.
+
+
+
+
+
+controlengined : A watchdog daemon for process control rules
+---------------------------------------------------------------
+In this system, process control decisions are made by small programs called
+rules. These are crafted on an application-specific basis. Controlengined
+launches and monitors these rules, and provides them with timers that they
+can use as triggers. So, even if there are a lot of rules in an installation,
+launching controlengined will start all of them.
+
+Any tag name which matches the format "timer.[x]sec", where [x] is a positive
+integer, will be picked up by controlengined. It will increment it's (unsigned
+integer) value by 1 every [x] seconds. No additional configuration is required
+to enable this functionality - just create the tagfd tags. 
+
+controlengined forks itself into a daemon (background process), so it (and all
+the rules it starts) will persist after the user logs out. 
+
+
+
+
+
+ruletoolkit.h : A toolkit for writing control rules
+---------------------------------------------------------------
+Though this is not an executable program, it makes rule-writing much easier than
+it would otherwise be. A full explanation of how it works would take significant
+space. See the comments at the top of include/ruletoolkit.h for information. 
+See also the individual rule code for examples. 
+
+
+
+Additional programs
+-------------------
+
+Three example rules for controlengined are also included: "rule-heatloss-sim",
+"rule-tempcontrol" and "rule-tempsimulator". They were for testing purposes and 
+should not be used. They do, however, serve as examples for writing useful rules.
+
+
+
